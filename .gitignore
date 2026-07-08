@@ -1,0 +1,18 @@
+# Video files (too large for git)
+*.mp4
+*.mov
+*.avi
+
+# Analysis outputs
+analysis_status.json
+
+# Python virtual environments
+venv/
+.venv/
+swim_env/
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
