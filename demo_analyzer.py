@@ -100,13 +100,12 @@ DEFAULT_CONFIG = {
     'start_motion_multiplier': 8,
     'start_threshold_floor':   0.005,  # absolute minimum threshold
 
-    # REACTION TIME / DQ CHECK
-    # Sound travels ~343 m/s. If the camera is ~10 m from the blocks the beep
-    # arrives at the swimmer's ears ~29 ms after the gun fires.
-    # Adjust sound_travel_s to match your filming distance.
-    # A swimmer is DQ'd if:  first_movement < beep_onset + sound_travel_s
-    # i.e. they left the block before the sound could physically reach them.
-    'sound_travel_s': 0.030,   # seconds — ~10 m camera-to-block distance
+    # REACTION TIME / DQ CHECK (FINA false-start rule)
+    # FINA disqualifies any start with reaction time < 0.10 s (100 ms).
+    # That covers movement before the beep (negative reaction) and
+    # impossibly fast reactions. Adjust only if your federation uses a
+    # different electronic threshold.
+    'fina_min_reaction_s': 0.10,
 
     # FINISH: sharp stop after minimum race time.
     # Lower finish_still_min_frames = catches wall touch sooner.
@@ -188,7 +187,7 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
     first_movement_time = None
     race_start_time     = beep_time   # pre-set from audio; None if not detected
     reaction_time       = None
-    is_dq               = False       # set True if movement before beep + travel time
+    is_dq               = False       # True if reaction_time < FINA minimum (0.10 s)
 
     prev_shoulder_x  = None
     baseline_vels    = []
@@ -279,13 +278,12 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
                     # If beep was not found in audio, fall back to motion as start
                     if race_start_time is None:
                         race_start_time = first_movement_time
-                    # Calculate reaction time and DQ check
+                    # Calculate reaction time and FINA false-start check
                     if beep_time is not None:
                         reaction_time = round(first_movement_time - beep_time, 3)
-                        # DQ if movement predates (beep_onset + time for sound to travel)
-                        # i.e. the swimmer was physically incapable of hearing the beep yet
-                        allowance = cfg.get('sound_travel_s', 0.030)
-                        if first_movement_time < (beep_time + allowance):
+                        fina_min = cfg.get('fina_min_reaction_s', 0.10)
+                        # FINA: DQ if reaction < 0.10 s (includes any negative reaction)
+                        if reaction_time < fina_min:
                             is_dq = True
                     detection_status = (
                         f"START @ {race_start_time:.2f}s"
@@ -295,9 +293,9 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
                     print(f"  [AUTO-DETECT] First MOVEMENT @ {first_movement_time:.2f}s  "
                           f"(ΔX={x_vel:.4f}, thresh={start_threshold:.4f})")
                     if beep_time is not None:
-                        dq_note = "  *** POTENTIAL DQ ***" if is_dq else ""
+                        dq_note = "  *** FINA FALSE START (DQ) ***" if is_dq else ""
                         print(f"  [REACTION TIME] {reaction_time:.3f}s  "
-                              f"(sound allowance={allowance:.3f}s){dq_note}")
+                              f"(FINA min={fina_min:.2f}s){dq_note}")
 
             # ── STEP 2: SHARP-STOP FINISH ──────────────────────────────────
             if race_start_time is not None and race_finish_time is None and first_movement_time is not None:
@@ -501,12 +499,12 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
     avg_tempo     = (arm_cycle_count / race_duration) * 60 * 2 if (arm_cycle_count > 0 and race_duration > 0) else 0.0
 
     if arm_cycle_count > 0 and clock_origin is not None:
-        allowance = cfg.get('sound_travel_s', 0.030)
+        fina_min = cfg.get('fina_min_reaction_s', 0.10)
         metrics = [
             "Beep Onset (s)",
             "First Movement (s)",
             "Reaction Time (s)",
-            f"Sound Travel ({allowance*1000:.0f} ms allowance)",
+            f"FINA Min Reaction ({fina_min*1000:.0f} ms)",
             "DQ Flag",
             "Race Start Clock (s)",
             "Race Finish (s)",
@@ -521,8 +519,8 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
             round(beep_time, 3)           if beep_time           is not None else "Not detected",
             round(first_movement_time, 3) if first_movement_time is not None else "Not detected",
             round(reaction_time, 3)       if reaction_time       is not None else "N/A",
-            f"moved {reaction_time - allowance:.3f}s after adjusted beep" if reaction_time is not None else "N/A",
-            "*** POTENTIAL DQ ***" if is_dq else "CLEAN",
+            "BELOW FINA MIN" if is_dq else "Above FINA min",
+            "*** FALSE START (DQ) ***" if is_dq else "CLEAN",
             round(clock_origin, 2),
             round(race_finish_time, 2)    if race_finish_time    is not None else "Not detected",
             round(race_duration, 2),
@@ -548,7 +546,7 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
         'beep_confidence':         round(beep_confidence, 2),
         'first_movement_time':     first_movement_time,
         'reaction_time_s':         reaction_time,
-        'sound_travel_s':          cfg.get('sound_travel_s', 0.030),
+        'fina_min_reaction_s':     cfg.get('fina_min_reaction_s', 0.10),
         'is_dq':                   is_dq,
         'race_start_time':         clock_origin,
         'race_finish_time':        race_finish_time,
