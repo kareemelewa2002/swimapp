@@ -69,12 +69,22 @@ def detect_starting_beep(video_path, search_window_s=12.0):
         print("  [BEEP] No distinct beep found in the audio.")
         return None, 0.0
 
-    beep_frame     = int(above[0])
-    beep_time      = float(times[beep_frame])
-    confidence     = float(band_energy[beep_frame]) / (mean_e + 1e-9)
+    # Find the peak of the first group of above-threshold frames.
+    # Then backtrack to find where energy first started rising above ambient
+    # (mean + 1σ) — that is the true beep onset, not its mid-point.
+    peak_frame    = int(above[np.argmax(band_energy[above])])
+    onset_thr     = mean_e + 1.0 * std_e
+    beep_frame    = peak_frame
+    for i in range(peak_frame, -1, -1):
+        if band_energy[i] < onset_thr:
+            beep_frame = i + 1   # first frame that crossed the onset level
+            break
 
-    print(f"  [BEEP] Detected @ {beep_time:.3f}s  "
-          f"(confidence {confidence:.1f}×, threshold={threshold:.4f})")
+    beep_time  = float(times[beep_frame])
+    confidence = float(band_energy[peak_frame]) / (mean_e + 1e-9)
+
+    print(f"  [BEEP] Onset @ {beep_time:.3f}s  "
+          f"(peak @ {times[peak_frame]:.3f}s, confidence {confidence:.1f}×)")
     return beep_time, confidence
 
 # ─────────────────────────────────────────────────────────────────────────── #
