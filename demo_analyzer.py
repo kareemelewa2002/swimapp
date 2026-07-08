@@ -6,6 +6,77 @@ import os
 import json
 from datetime import datetime
 
+try:
+    import librosa
+    _LIBROSA_AVAILABLE = True
+except ImportError:
+    _LIBROSA_AVAILABLE = False
+
+
+def detect_starting_beep(video_path, search_window_s=12.0):
+    """
+    Detect the starting beep in the video's audio track.
+
+    Strategy:
+    - Load the first `search_window_s` seconds of audio.
+    - Compute per-frame energy in the 800–4000 Hz band (where electronic
+      start beeps and starter pistols live).
+    - Find the first frame whose band energy exceeds a dynamic threshold
+      (mean + 3 × std of the whole window), which is where the beep is.
+
+    Returns (beep_timestamp_s, confidence_ratio) or (None, 0.0) on failure.
+    confidence_ratio is peak_energy / mean_energy — higher = sharper spike.
+    """
+    if not _LIBROSA_AVAILABLE:
+        print("  [BEEP] librosa not available — skipping audio detection.")
+        return None, 0.0
+
+    try:
+        y, sr = librosa.load(video_path, sr=22050, mono=True,
+                             offset=0.0, duration=search_window_s)
+    except Exception as e:
+        print(f"  [BEEP] Could not load audio from '{video_path}': {e}")
+        return None, 0.0
+
+    # STFT → frequency bins × time frames
+    n_fft    = 2048
+    hop_len  = 512
+    D        = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop_len))
+    freqs    = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    times    = librosa.frames_to_time(np.arange(D.shape[1]),
+                                      sr=sr, hop_length=hop_len)
+
+    # Isolate 800–4000 Hz band
+    band_mask   = (freqs >= 800) & (freqs <= 4000)
+    band_energy = D[band_mask, :].mean(axis=0)   # (n_frames,)
+
+    if band_energy.max() == 0:
+        print("  [BEEP] Audio track appears silent.")
+        return None, 0.0
+
+    # Dynamic threshold: mean + 3 × std catches a sharp beep over ambient noise
+    mean_e = float(np.mean(band_energy))
+    std_e  = float(np.std(band_energy))
+    threshold = mean_e + 3.0 * std_e
+
+    above = np.where(band_energy > threshold)[0]
+    if len(above) == 0:
+        # Fall back to a softer threshold (mean + 2 × std)
+        threshold = mean_e + 2.0 * std_e
+        above = np.where(band_energy > threshold)[0]
+
+    if len(above) == 0:
+        print("  [BEEP] No distinct beep found in the audio.")
+        return None, 0.0
+
+    beep_frame     = int(above[0])
+    beep_time      = float(times[beep_frame])
+    confidence     = float(band_energy[beep_frame]) / (mean_e + 1e-9)
+
+    print(f"  [BEEP] Detected @ {beep_time:.3f}s  "
+          f"(confidence {confidence:.1f}×, threshold={threshold:.4f})")
+    return beep_time, confidence
+
 # ─────────────────────────────────────────────────────────────────────────── #
 #  DEFAULT CONFIGURATION                                                       #
 #  All tunable thresholds live here so the retry loop can override them.      #
@@ -55,6 +126,13 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
 
     print(f"Loading AI Models to analyse '{input_video_path}'...")
 
+    # ── AUDIO: BEEP DETECTION ───────────────────────────────────────────────
+    # Run before the video loop (audio is independent of pose estimation).
+    print("  Scanning audio track for starting beep…")
+    beep_time, beep_confidence = detect_starting_beep(
+        input_video_path, search_window_s=cfg.get('beep_search_window_s', 12.0)
+    )
+
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(
         static_image_mode=False,
@@ -77,10 +155,14 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
 
     # ── AUTO-START ─────────────────────────────────────────────────────────
-    # Phase A: collect baseline velocities while the swimmer is still.
-    # Phase B: fire when velocity exceeds baseline × multiplier.
-    # This catches the first lean/weight-shift on the block, not just the dive.
-    race_start_time  = None
+    # beep_time       → when the starting signal fired (from audio)
+    # first_movement_time → when the body first moved (velocity spike on block)
+    # race_start_time → whichever is available; beep preferred as the "clock zero"
+    # reaction_time   → first_movement_time − beep_time (how long on the block)
+    first_movement_time = None
+    race_start_time     = beep_time   # pre-set from audio; None if not detected
+    reaction_time       = None
+
     prev_shoulder_x  = None
     baseline_vels    = []
     start_threshold  = cfg['start_threshold_floor']   # refined once baseline is ready
@@ -138,7 +220,7 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
             x_vel = abs(avg_shoulder_x - prev_shoulder_x) if prev_shoulder_x is not None else 0.0
 
             # ── STEP 1: ADAPTIVE START ─────────────────────────────────────
-            if race_start_time is None:
+            if first_movement_time is None:
                 # Phase A — calibrate from stillness
                 if len(baseline_vels) < cfg['baseline_frames']:
                     if prev_shoulder_x is not None and x_vel < 0.03:
@@ -154,13 +236,25 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
 
                 # Phase B — detect first motion on the block
                 if prev_shoulder_x is not None and x_vel > start_threshold:
-                    race_start_time  = ts
-                    detection_status = f"START @ {race_start_time:.2f}s"
-                    print(f"  [AUTO-DETECT] Race START @ {race_start_time:.2f}s  "
+                    first_movement_time = ts
+                    # If beep was not found in audio, fall back to motion as start
+                    if race_start_time is None:
+                        race_start_time = first_movement_time
+                    # Calculate reaction time
+                    if beep_time is not None:
+                        reaction_time = round(first_movement_time - beep_time, 3)
+                    detection_status = (
+                        f"START @ {race_start_time:.2f}s"
+                        + (f"  RT={reaction_time:.3f}s" if reaction_time is not None else "")
+                    )
+                    print(f"  [AUTO-DETECT] First MOVEMENT @ {first_movement_time:.2f}s  "
                           f"(ΔX={x_vel:.4f}, thresh={start_threshold:.4f})")
+                    if beep_time is not None:
+                        print(f"  [REACTION TIME] {reaction_time:.3f}s  "
+                              f"(moved {reaction_time:.3f}s after beep)")
 
             # ── STEP 2: SHARP-STOP FINISH ──────────────────────────────────
-            elif race_finish_time is None:
+            if race_start_time is not None and race_finish_time is None and first_movement_time is not None:
                 elapsed = ts - race_start_time
                 if elapsed > cfg['min_race_duration']:
                     if x_vel < cfg['finish_velocity_threshold']:
@@ -178,10 +272,12 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
             prev_shoulder_x = avg_shoulder_x
 
             # ── STEP 3: SINGLE-ARM CYCLE STROKE DETECTION ─────────────────
+            # Strokes are only counted after the swimmer is actually in the water,
+            # i.e. after first body movement (not just the beep).
             race_is_live = (
-                race_start_time is not None
+                first_movement_time is not None
                 and race_finish_time is None
-                and ts > race_start_time
+                and ts > first_movement_time
             )
 
             if race_is_live:
@@ -298,25 +394,39 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
         prev_gray = curr_gray
 
         # ── OVERLAY DASHBOARD ───────────────────────────────────────────────
-        race_elapsed  = ts - race_start_time if race_start_time is not None else 0.0
+        # Race clock counts from the BEEP (official start), not first movement.
+        clock_origin  = race_start_time   # beep time if available, else first movement
+        race_elapsed  = ts - clock_origin if clock_origin is not None else 0.0
 
-        # Race Time = finish − start, shown once finish is locked; counts up live until then
+        # Race Time = finish − beep, shown once finish is locked; counts up live until then
         if race_finish_time is not None:
-            race_time_s  = race_finish_time - race_start_time
-            mins         = int(race_time_s // 60)
-            secs         = race_time_s % 60
-            race_time_str = f"FINAL {mins}:{secs:05.2f}"
-            race_time_colour = (0, 215, 255)   # gold
-        elif race_start_time is not None:
-            mins         = int(race_elapsed // 60)
-            secs         = race_elapsed % 60
-            race_time_str = f"{mins}:{secs:05.2f}"
-            race_time_colour = (255, 255, 255)
+            race_time_s       = race_finish_time - clock_origin
+            mins              = int(race_time_s // 60)
+            secs              = race_time_s % 60
+            race_time_str     = f"FINAL {mins}:{secs:05.2f}"
+            race_time_colour  = (0, 215, 255)   # gold
+        elif clock_origin is not None:
+            mins              = int(race_elapsed // 60)
+            secs              = race_elapsed % 60
+            race_time_str     = f"{mins}:{secs:05.2f}"
+            race_time_colour  = (255, 255, 255)
         else:
-            race_time_str  = "--:--.--"
-            race_time_colour = (160, 160, 160)
+            race_time_str     = "--:--.--"
+            race_time_colour  = (160, 160, 160)
 
-        cv2.rectangle(frame, (10, 10), (560, 255), (0, 0, 0), -1)
+        # Reaction time string
+        if reaction_time is not None:
+            rt_str   = f"{reaction_time:.3f}s"
+            rt_color = (0, 255, 128)   # green-ish
+        elif beep_time is not None and first_movement_time is None:
+            rt_str   = "waiting…"
+            rt_color = (160, 160, 160)
+        else:
+            rt_str   = "no beep"
+            rt_color = (100, 100, 100)
+
+        overlay_h = 300 if beep_time is not None else 255
+        cv2.rectangle(frame, (10, 10), (580, overlay_h), (0, 0, 0), -1)
         cv2.putText(frame, detection_status, (20, 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 200, 0), 2)
         cv2.putText(frame, f"Signal       : BOTH WRISTS (dedup {cfg['min_cycle_time']}s)", (20, 85),
@@ -328,6 +438,9 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
         cv2.putText(frame, f"Race Time    : {race_time_str}", (20, 210),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, race_time_colour, 2)
+        if beep_time is not None:
+            cv2.putText(frame, f"Reaction Time: {rt_str}", (20, 255),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, rt_color, 2)
 
         out.write(frame)
 
@@ -335,50 +448,64 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
     out.release()
 
     # ── PANDAS SUMMARY ──────────────────────────────────────────────────────
-    finish_ref = race_finish_time if race_finish_time else (stroke_timestamps[-1] if stroke_timestamps else None)
-    race_duration = (finish_ref - race_start_time) if (finish_ref and race_start_time) else 0.0
-    avg_tempo = (arm_cycle_count / race_duration) * 60 * 2 if (arm_cycle_count > 0 and race_duration > 0) else 0.0
+    finish_ref    = race_finish_time if race_finish_time else (stroke_timestamps[-1] if stroke_timestamps else None)
+    clock_origin  = race_start_time  # beep if detected, else first movement
+    race_duration = (finish_ref - clock_origin) if (finish_ref and clock_origin) else 0.0
+    avg_tempo     = (arm_cycle_count / race_duration) * 60 * 2 if (arm_cycle_count > 0 and race_duration > 0) else 0.0
 
-    if arm_cycle_count > 0 and race_start_time is not None:
-        summary_data = {
-            "Metric": [
-                "Race Start (s)", "Race Finish (s)", "Race Duration (s)",
-                "Arm Cycles Detected", "Estimated Total Strokes",
-                "Average Tempo (SPM)", "Final Tempo (SPM)", "Tracking Arm",
-            ],
-            "Value": [
-                round(race_start_time, 2),
-                round(race_finish_time, 2) if race_finish_time else "Not detected",
-                round(race_duration, 2),
-                arm_cycle_count,
-                arm_cycle_count * 2,
-                round(avg_tempo, 1),
-                round(current_stroke_rate, 1),
-                "both",
-            ],
-        }
-        df = pd.DataFrame(summary_data)
-        print("\n" + "=" * 50)
+    if arm_cycle_count > 0 and clock_origin is not None:
+        metrics = [
+            "Beep Time (s)",
+            "First Movement (s)",
+            "Reaction Time (s)",
+            "Race Start Clock (s)",
+            "Race Finish (s)",
+            "Race Duration (s)",
+            "Arm Cycles Detected",
+            "Estimated Total Strokes",
+            "Average Tempo (SPM)",
+            "Final Tempo (SPM)",
+            "Tracking Arm",
+        ]
+        values = [
+            round(beep_time, 3)           if beep_time           is not None else "Not detected",
+            round(first_movement_time, 3) if first_movement_time is not None else "Not detected",
+            round(reaction_time, 3)       if reaction_time       is not None else "N/A",
+            round(clock_origin, 2),
+            round(race_finish_time, 2)    if race_finish_time    is not None else "Not detected",
+            round(race_duration, 2),
+            arm_cycle_count,
+            arm_cycle_count * 2,
+            round(avg_tempo, 1),
+            round(current_stroke_rate, 1),
+            "both",
+        ]
+        df = pd.DataFrame({"Metric": metrics, "Value": values})
+        print("\n" + "=" * 55)
         print("  RACE EXECUTION SUMMARY")
-        print("=" * 50)
+        print("=" * 55)
         print(df.to_string(index=False))
-        print("=" * 50 + "\n")
+        print("=" * 55 + "\n")
     else:
         print("\nNo strokes or race boundaries detected.\n")
 
     print(f"Analysis complete → '{output_video_path}'")
 
     return {
-        'race_start_time':        race_start_time,
-        'race_finish_time':       race_finish_time,
-        'race_duration_s':        round(race_duration, 2),
-        'arm_cycle_count':        arm_cycle_count,
+        'beep_time':               beep_time,
+        'beep_confidence':         round(beep_confidence, 2),
+        'first_movement_time':     first_movement_time,
+        'reaction_time_s':         reaction_time,
+        'race_start_time':         clock_origin,
+        'race_finish_time':        race_finish_time,
+        'race_duration_s':         round(race_duration, 2),
+        'arm_cycle_count':         arm_cycle_count,
         'estimated_total_strokes': arm_cycle_count * 2,
-        'average_tempo_spm':      round(avg_tempo, 1),
-        'final_tempo_spm':        round(current_stroke_rate, 1),
-        'tracking_arm':           'both',
-        'start_threshold_used':   round(start_threshold, 5),
-        'output_file':            output_video_path,
+        'average_tempo_spm':       round(avg_tempo, 1),
+        'final_tempo_spm':         round(current_stroke_rate, 1),
+        'tracking_arm':            'both',
+        'start_threshold_used':    round(start_threshold, 5),
+        'output_file':             output_video_path,
     }
 
 
@@ -441,19 +568,23 @@ if __name__ == "__main__":
 
         # Write status file after every attempt so iOS / remote monitoring works
         status = {
-            'status':           'success' if (start_ok and finish_ok) else 'partial' if (start_ok or finish_ok) else 'failed',
-            'attempt':          attempt,
-            'total_attempts':   len(RETRY_CONFIGS),
-            'start_detected':   start_ok,
-            'finish_detected':  finish_ok,
-            'race_start_s':     result.get('race_start_time')  if result else None,
-            'race_finish_s':    result.get('race_finish_time') if result else None,
-            'race_duration_s':  result.get('race_duration_s')  if result else None,
-            'arm_cycles':       result.get('arm_cycle_count')  if result else None,
-            'estimated_strokes':result.get('estimated_total_strokes') if result else None,
-            'avg_tempo_spm':    result.get('average_tempo_spm') if result else None,
-            'output_file':      output_path,
-            'last_updated':     datetime.now().isoformat(),
+            'status':             'success' if (start_ok and finish_ok) else 'partial' if (start_ok or finish_ok) else 'failed',
+            'attempt':            attempt,
+            'total_attempts':     len(RETRY_CONFIGS),
+            'start_detected':     start_ok,
+            'finish_detected':    finish_ok,
+            'beep_time_s':        result.get('beep_time')           if result else None,
+            'beep_confidence':    result.get('beep_confidence')     if result else None,
+            'first_movement_s':   result.get('first_movement_time') if result else None,
+            'reaction_time_s':    result.get('reaction_time_s')     if result else None,
+            'race_start_s':       result.get('race_start_time')     if result else None,
+            'race_finish_s':      result.get('race_finish_time')    if result else None,
+            'race_duration_s':    result.get('race_duration_s')     if result else None,
+            'arm_cycles':         result.get('arm_cycle_count')     if result else None,
+            'estimated_strokes':  result.get('estimated_total_strokes') if result else None,
+            'avg_tempo_spm':      result.get('average_tempo_spm')   if result else None,
+            'output_file':        output_path,
+            'last_updated':       datetime.now().isoformat(),
         }
         with open('analysis_status.json', 'w') as f:
             json.dump(status, f, indent=2)
