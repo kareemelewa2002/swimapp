@@ -23,14 +23,25 @@ DEFAULT_CONFIG = {
     'finish_velocity_threshold':  0.015,  # normalised units/frame
     'finish_still_min_frames':    8,      # ~0.27s at 30fps = catches wall touch
 
-    # STROKE DETECTION
-    # Both wrists are tracked in parallel; whichever completes a recovery→entry
-    # cycle first counts, subject to min_cycle_time deduplication.
-    'recovery_offset':  0.05,  # wrist_y < shoulder_y + this → arm in recovery
-    'entry_offset':     0.08,  # wrist_y > shoulder_y + this → arm entered water
-    'smoothing_frames': 2,     # minimal smoothing keeps signal responsive
-    'min_cycle_time':   0.45,  # deduplicate: ignore a second hit within this window
-    'max_cycle_time':   3.0,   # ignore implausibly slow cycles
+    # STROKE DETECTION — wrist anatomy (runs always)
+    'recovery_offset':  0.05,
+    'entry_offset':     0.08,
+    'smoothing_frames': 2,
+    'min_cycle_time':   0.45,  # global dedup gate shared by all detectors
+    'max_cycle_time':   3.0,
+
+    # STROKE DETECTION — splash frame-diff (runs in parallel)
+    # A hand entry creates a burst of bright pixels in a water-level ROI
+    # anchored to the swimmer's shoulder position.
+    'splash_enabled':        True,
+    'splash_roi_half_w':     0.30,  # ROI half-width in normalised coords
+    'splash_roi_y_above':    0.05,  # ROI top edge above shoulder_y
+    'splash_roi_y_below':    0.18,  # ROI bottom edge below shoulder_y
+    'splash_smoothing':      4,     # frames to smooth the diff signal
+    # Auto-calibration: threshold = baseline_mean + multiplier × baseline_std
+    'splash_cal_frames':     60,    # calibration frames (pre-race still water)
+    'splash_multiplier':     5.0,   # sensitivity; lower = more sensitive
+    'splash_min_floor':      3.0,   # absolute floor (pixel units, 0-255 scale)
 }
 
 
@@ -94,6 +105,13 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
     lw_recovering  = False
     rw_recovering  = False
 
+    # Splash frame-diff detector state
+    prev_gray           = None
+    splash_diff_history = []          # smoothed diff scores
+    splash_cal_scores   = []          # scores collected during calibration
+    splash_threshold    = None        # set once calibration is complete
+    in_splash           = False       # True while score is above threshold
+
     detection_status = "Calibrating baseline..."
 
     print("Analysing frames… this may take a few minutes.")
@@ -105,6 +123,7 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
 
         ts        = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         results   = pose.process(frame_rgb)
 
         if results.pose_landmarks:
@@ -217,7 +236,70 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
                             if cfg['min_cycle_time'] <= median_gap <= cfg['max_cycle_time']:
                                 current_stroke_rate = (1.0 / median_gap) * 60.0 * 2.0
 
+            # ── STEP 4: SPLASH FRAME-DIFF DETECTOR ────────────────────────
+            if cfg['splash_enabled']:
+                if prev_gray is not None:
+                    # Swimmer-anchored ROI at water level
+                    rx1 = max(0,     int((avg_shoulder_x - cfg['splash_roi_half_w']) * width))
+                    rx2 = min(width, int((avg_shoulder_x + cfg['splash_roi_half_w']) * width))
+                    ry1 = max(0,      int((avg_shoulder_y - cfg['splash_roi_y_above']) * height))
+                    ry2 = min(height, int((avg_shoulder_y + cfg['splash_roi_y_below']) * height))
+
+                    roi_diff = cv2.absdiff(curr_gray[ry1:ry2, rx1:rx2],
+                                           prev_gray[ry1:ry2, rx1:rx2])
+                    diff_score = float(np.mean(roi_diff))
+
+                    # Calibrate threshold from pre-race still water
+                    if splash_threshold is None:
+                        if len(splash_cal_scores) < cfg['splash_cal_frames']:
+                            splash_cal_scores.append(diff_score)
+                        else:
+                            mean_c = float(np.mean(splash_cal_scores))
+                            std_c  = float(np.std(splash_cal_scores))
+                            splash_threshold = max(
+                                mean_c + cfg['splash_multiplier'] * std_c,
+                                cfg['splash_min_floor']
+                            )
+                            print(f"  [SPLASH CAL] threshold={splash_threshold:.2f} "
+                                  f"(mean={mean_c:.2f} std={std_c:.2f})")
+
+                    # Smooth and detect peaks
+                    splash_diff_history.append(diff_score)
+                    if len(splash_diff_history) > cfg['splash_smoothing']:
+                        splash_diff_history.pop(0)
+                    smoothed_diff = sum(splash_diff_history) / len(splash_diff_history)
+
+                    if splash_threshold is not None and race_is_live:
+                        if smoothed_diff > splash_threshold:
+                            in_splash = True
+                        elif in_splash:
+                            # Trailing edge of the splash peak → stroke entry confirmed
+                            in_splash = False
+                            last_ts = arm_cycle_timestamps[-1] if arm_cycle_timestamps else 0.0
+                            if (ts - last_ts) >= cfg['min_cycle_time']:
+                                arm_cycle_count += 1
+                                arm_cycle_timestamps.append(ts)
+                                stroke_timestamps.append(ts)
+
+                                if len(arm_cycle_timestamps) >= 2:
+                                    gaps = [
+                                        arm_cycle_timestamps[i] - arm_cycle_timestamps[i - 1]
+                                        for i in range(
+                                            max(1, len(arm_cycle_timestamps) - 3),
+                                            len(arm_cycle_timestamps)
+                                        )
+                                    ]
+                                    median_gap = sorted(gaps)[len(gaps) // 2]
+                                    if cfg['min_cycle_time'] <= median_gap <= cfg['max_cycle_time']:
+                                        current_stroke_rate = (1.0 / median_gap) * 60.0 * 2.0
+
+                    # Draw ROI on frame for visual debugging
+                    cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (0, 165, 255), 1)
+
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+        # Always update prev_gray (outside pose block so no frames are skipped)
+        prev_gray = curr_gray
 
         # ── OVERLAY DASHBOARD ───────────────────────────────────────────────
         race_elapsed  = ts - race_start_time if race_start_time is not None else 0.0
