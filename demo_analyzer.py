@@ -37,11 +37,11 @@ DEFAULT_CONFIG = {
     'splash_roi_half_w':     0.30,  # ROI half-width in normalised coords
     'splash_roi_y_above':    0.05,  # ROI top edge above shoulder_y
     'splash_roi_y_below':    0.18,  # ROI bottom edge below shoulder_y
-    'splash_smoothing':      4,     # frames to smooth the diff signal
-    # Auto-calibration: threshold = baseline_mean + multiplier × baseline_std
-    'splash_cal_frames':     60,    # calibration frames (pre-race still water)
-    'splash_multiplier':     5.0,   # sensitivity; lower = more sensitive
-    'splash_min_floor':      3.0,   # absolute floor (pixel units, 0-255 scale)
+    'splash_smoothing':      3,     # frames to smooth the diff signal
+    # Adaptive rolling-median threshold: adapts to camera panning speed.
+    # threshold = rolling_median(last N frames) × relative_multiplier
+    'splash_rolling_window':     45,   # frames for the rolling median baseline
+    'splash_relative_multiplier': 2.0, # spike must be this many × rolling median
 }
 
 
@@ -107,10 +107,9 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
 
     # Splash frame-diff detector state
     prev_gray           = None
-    splash_diff_history = []          # smoothed diff scores
-    splash_cal_scores   = []          # scores collected during calibration
-    splash_threshold    = None        # set once calibration is complete
-    in_splash           = False       # True while score is above threshold
+    splash_diff_history = []          # short smoothing window
+    splash_rolling      = []          # longer rolling window for adaptive baseline
+    in_splash           = False       # True while score is above adaptive threshold
 
     detection_status = "Calibrating baseline..."
 
@@ -249,49 +248,46 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
                                            prev_gray[ry1:ry2, rx1:rx2])
                     diff_score = float(np.mean(roi_diff))
 
-                    # Calibrate threshold from pre-race still water
-                    if splash_threshold is None:
-                        if len(splash_cal_scores) < cfg['splash_cal_frames']:
-                            splash_cal_scores.append(diff_score)
-                        else:
-                            mean_c = float(np.mean(splash_cal_scores))
-                            std_c  = float(np.std(splash_cal_scores))
-                            splash_threshold = max(
-                                mean_c + cfg['splash_multiplier'] * std_c,
-                                cfg['splash_min_floor']
-                            )
-                            print(f"  [SPLASH CAL] threshold={splash_threshold:.2f} "
-                                  f"(mean={mean_c:.2f} std={std_c:.2f})")
-
-                    # Smooth and detect peaks
+                    # Always update smoothing and rolling windows
                     splash_diff_history.append(diff_score)
                     if len(splash_diff_history) > cfg['splash_smoothing']:
                         splash_diff_history.pop(0)
                     smoothed_diff = sum(splash_diff_history) / len(splash_diff_history)
 
-                    if splash_threshold is not None and race_is_live:
-                        if smoothed_diff > splash_threshold:
-                            in_splash = True
-                        elif in_splash:
-                            # Trailing edge of the splash peak → stroke entry confirmed
-                            in_splash = False
-                            last_ts = arm_cycle_timestamps[-1] if arm_cycle_timestamps else 0.0
-                            if (ts - last_ts) >= cfg['min_cycle_time']:
-                                arm_cycle_count += 1
-                                arm_cycle_timestamps.append(ts)
-                                stroke_timestamps.append(ts)
+                    splash_rolling.append(smoothed_diff)
+                    if len(splash_rolling) > cfg['splash_rolling_window']:
+                        splash_rolling.pop(0)
 
-                                if len(arm_cycle_timestamps) >= 2:
-                                    gaps = [
-                                        arm_cycle_timestamps[i] - arm_cycle_timestamps[i - 1]
-                                        for i in range(
-                                            max(1, len(arm_cycle_timestamps) - 3),
-                                            len(arm_cycle_timestamps)
-                                        )
-                                    ]
-                                    median_gap = sorted(gaps)[len(gaps) // 2]
-                                    if cfg['min_cycle_time'] <= median_gap <= cfg['max_cycle_time']:
-                                        current_stroke_rate = (1.0 / median_gap) * 60.0 * 2.0
+                    # Adaptive threshold = rolling median × relative_multiplier
+                    # Rolling median tracks current camera-pan baseline automatically.
+                    if len(splash_rolling) >= cfg['splash_smoothing']:
+                        sorted_roll  = sorted(splash_rolling)
+                        roll_median  = sorted_roll[len(sorted_roll) // 2]
+                        adaptive_thr = roll_median * cfg['splash_relative_multiplier']
+
+                        if race_is_live:
+                            if smoothed_diff > adaptive_thr:
+                                in_splash = True
+                            elif in_splash:
+                                # Trailing edge of splash peak → stroke entry
+                                in_splash = False
+                                last_ts = arm_cycle_timestamps[-1] if arm_cycle_timestamps else 0.0
+                                if (ts - last_ts) >= cfg['min_cycle_time']:
+                                    arm_cycle_count += 1
+                                    arm_cycle_timestamps.append(ts)
+                                    stroke_timestamps.append(ts)
+
+                                    if len(arm_cycle_timestamps) >= 2:
+                                        gaps = [
+                                            arm_cycle_timestamps[i] - arm_cycle_timestamps[i - 1]
+                                            for i in range(
+                                                max(1, len(arm_cycle_timestamps) - 3),
+                                                len(arm_cycle_timestamps)
+                                            )
+                                        ]
+                                        median_gap = sorted(gaps)[len(gaps) // 2]
+                                        if cfg['min_cycle_time'] <= median_gap <= cfg['max_cycle_time']:
+                                            current_stroke_rate = (1.0 / median_gap) * 60.0 * 2.0
 
                     # Draw ROI on frame for visual debugging
                     cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (0, 165, 255), 1)
