@@ -114,6 +114,12 @@ DEFAULT_CONFIG = {
     'finish_velocity_threshold':  0.015,  # normalised units/frame
     'finish_still_min_frames':    8,      # ~0.27s at 30fps = catches wall touch
 
+    # PERSON LOCK — ignore frames where MediaPipe switches to a bystander.
+    # If the shoulder centroid jumps more than this fraction of frame width
+    # in a single frame, the detection is discarded as a person-switch.
+    # 0.20 = 20 % of frame width; physically impossible for a swimmer mid-race.
+    'person_lock_max_jump': 0.20,
+
     # STROKE DETECTION — wrist anatomy (runs always)
     'recovery_offset':  0.05,
     'entry_offset':     0.08,
@@ -235,6 +241,18 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
             rs = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
             lw = lm[mp_pose.PoseLandmark.LEFT_WRIST.value]
             rw = lm[mp_pose.PoseLandmark.RIGHT_WRIST.value]
+
+            # ── PERSON LOCK ────────────────────────────────────────────────
+            # If shoulders teleport more than person_lock_max_jump in one frame,
+            # MediaPipe switched to a bystander — skip this frame entirely and
+            # do NOT draw landmarks so the user sees only their own skeleton.
+            new_shoulder_x = (ls.x + rs.x) / 2.0
+            if prev_shoulder_x is not None:
+                jump = abs(new_shoulder_x - prev_shoulder_x)
+                if jump > cfg['person_lock_max_jump']:
+                    prev_gray = curr_gray
+                    continue   # discard this detection; keep prev_shoulder_x unchanged
+            # ──────────────────────────────────────────────────────────────
 
             avg_shoulder_x = (ls.x + rs.x) / 2.0
             avg_shoulder_y = (ls.y + rs.y) / 2.0
