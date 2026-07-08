@@ -23,22 +23,14 @@ DEFAULT_CONFIG = {
     'finish_velocity_threshold':  0.015,  # normalised units/frame
     'finish_still_min_frames':    8,      # ~0.27s at 30fps = catches wall touch
 
-    # STROKE DETECTION — wrist signal (primary)
-    'recovery_offset':      0.03,  # wrist_y < shoulder_y + this → recovering
-    'entry_offset':         0.09,  # wrist_y > shoulder_y + this → entered water
-    'smoothing_frames':     3,
-    'arm_vote_window':      20,
-    'visibility_margin':    0.10,
-    'min_cycle_time':       0.5,   # ignore implausibly fast cycles
-    'max_cycle_time':       3.0,   # ignore implausibly slow cycles
-
-    # STROKE DETECTION — shoulder-roll fallback (used when wrist is occluded)
-    # In freestyle the body rolls toward the recovering arm each stroke.
-    # shoulder_roll = left_shoulder_y − right_shoulder_y
-    #   positive → left side lower → right arm recovering
-    #   negative → right side lower → left arm recovering
-    'wrist_visibility_min':    0.5,    # below this → use roll fallback
-    'shoulder_roll_threshold': 0.015,  # roll must cross ±this to count a phase
+    # STROKE DETECTION
+    # Both wrists are tracked in parallel; whichever completes a recovery→entry
+    # cycle first counts, subject to min_cycle_time deduplication.
+    'recovery_offset':  0.05,  # wrist_y < shoulder_y + this → arm in recovery
+    'entry_offset':     0.08,  # wrist_y > shoulder_y + this → arm entered water
+    'smoothing_frames': 2,     # minimal smoothing keeps signal responsive
+    'min_cycle_time':   0.45,  # deduplicate: ignore a second hit within this window
+    'max_cycle_time':   3.0,   # ignore implausibly slow cycles
 }
 
 
@@ -96,10 +88,11 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
     current_stroke_rate  = 0.0
     is_recovering        = False
 
-    wrist_y_history        = []
-    shoulder_roll_history  = []
-    tracked_arm            = None
-    arm_votes              = {'left': 0, 'right': 0}
+    # Per-wrist smoothing histories and recovery latches
+    lw_y_history   = []
+    rw_y_history   = []
+    lw_recovering  = False
+    rw_recovering  = False
 
     detection_status = "Calibrating baseline..."
 
@@ -174,80 +167,60 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
             )
 
             if race_is_live:
-                # Dynamic arm selection via visibility-vote hysteresis
-                if lw.visibility > rw.visibility + cfg['visibility_margin']:
-                    arm_votes['left'] += 1
-                elif rw.visibility > lw.visibility + cfg['visibility_margin']:
-                    arm_votes['right'] += 1
+                rec_thresh   = avg_shoulder_y + cfg['recovery_offset']
+                entry_thresh = avg_shoulder_y + cfg['entry_offset']
+                cycle_fired  = False
 
-                if (arm_votes['left'] + arm_votes['right']) >= cfg['arm_vote_window']:
-                    tracked_arm = 'left' if arm_votes['left'] >= arm_votes['right'] else 'right'
-                    arm_votes   = {'left': 0, 'right': 0}
+                # ── LEFT WRIST ──────────────────────────────────────────────
+                lw_y_history.append(lw.y)
+                if len(lw_y_history) > cfg['smoothing_frames']:
+                    lw_y_history.pop(0)
+                slw = sum(lw_y_history) / len(lw_y_history)
 
-                if tracked_arm is None:
-                    tracked_arm = 'left' if lw.visibility >= rw.visibility else 'right'
+                if slw < rec_thresh:
+                    lw_recovering = True
+                elif slw > entry_thresh and lw_recovering:
+                    lw_recovering = False
+                    cycle_fired   = True
 
-                wrist      = lw if tracked_arm == 'left' else rw
-                # shoulder_roll > 0 means left shoulder is lower → right side rolling up
-                shoulder_roll = ls.y - rs.y
-                # Flip sign so that a positive value always means the TRACKED arm is recovering
-                roll_sign     = 1.0 if tracked_arm == 'right' else -1.0
-                signed_roll   = shoulder_roll * roll_sign
+                # ── RIGHT WRIST ─────────────────────────────────────────────
+                rw_y_history.append(rw.y)
+                if len(rw_y_history) > cfg['smoothing_frames']:
+                    rw_y_history.pop(0)
+                srw = sum(rw_y_history) / len(rw_y_history)
 
-                recovery_triggered = False
-                entry_triggered    = False
+                if srw < rec_thresh:
+                    rw_recovering = True
+                elif srw > entry_thresh and rw_recovering:
+                    rw_recovering = False
+                    cycle_fired   = True
 
-                if wrist.visibility >= cfg['wrist_visibility_min']:
-                    # ── PRIMARY: wrist Y signal ────────────────────────────
-                    wrist_y_history.append(wrist.y)
-                    if len(wrist_y_history) > cfg['smoothing_frames']:
-                        wrist_y_history.pop(0)
-                    sw = sum(wrist_y_history) / len(wrist_y_history)
+                # ── DEDUPLICATE & COUNT ─────────────────────────────────────
+                # Accept the first trigger in any min_cycle_time window.
+                if cycle_fired:
+                    last_ts = arm_cycle_timestamps[-1] if arm_cycle_timestamps else 0.0
+                    if (ts - last_ts) >= cfg['min_cycle_time']:
+                        arm_cycle_count += 1
+                        arm_cycle_timestamps.append(ts)
+                        stroke_timestamps.append(ts)
 
-                    if sw < avg_shoulder_y + cfg['recovery_offset']:
-                        recovery_triggered = True
-                    elif sw > avg_shoulder_y + cfg['entry_offset']:
-                        entry_triggered = True
-                else:
-                    # ── FALLBACK: shoulder roll ────────────────────────────
-                    # Clear stale wrist history so it doesn't bias re-entry
-                    wrist_y_history.clear()
-                    shoulder_roll_history.append(signed_roll)
-                    if len(shoulder_roll_history) > cfg['smoothing_frames']:
-                        shoulder_roll_history.pop(0)
-                    sr = sum(shoulder_roll_history) / len(shoulder_roll_history)
-
-                    if sr > cfg['shoulder_roll_threshold']:
-                        recovery_triggered = True
-                    elif sr < -cfg['shoulder_roll_threshold']:
-                        entry_triggered = True
-
-                if recovery_triggered and not is_recovering:
-                    is_recovering = True
-                elif entry_triggered and is_recovering:
-                    arm_cycle_count += 1
-                    arm_cycle_timestamps.append(ts)
-                    stroke_timestamps.append(ts)
-                    is_recovering = False
-
-                    # Median of last 3 gaps → stable SPM, outlier-resistant
-                    if len(arm_cycle_timestamps) >= 2:
-                        gaps = [
-                            arm_cycle_timestamps[i] - arm_cycle_timestamps[i - 1]
-                            for i in range(
-                                max(1, len(arm_cycle_timestamps) - 3),
-                                len(arm_cycle_timestamps)
-                            )
-                        ]
-                        median_gap = sorted(gaps)[len(gaps) // 2]
-                        if cfg['min_cycle_time'] <= median_gap <= cfg['max_cycle_time']:
-                            current_stroke_rate = (1.0 / median_gap) * 60.0 * 2.0
+                        # Median of last 3 gaps → stable, outlier-resistant SPM
+                        if len(arm_cycle_timestamps) >= 2:
+                            gaps = [
+                                arm_cycle_timestamps[i] - arm_cycle_timestamps[i - 1]
+                                for i in range(
+                                    max(1, len(arm_cycle_timestamps) - 3),
+                                    len(arm_cycle_timestamps)
+                                )
+                            ]
+                            median_gap = sorted(gaps)[len(gaps) // 2]
+                            if cfg['min_cycle_time'] <= median_gap <= cfg['max_cycle_time']:
+                                current_stroke_rate = (1.0 / median_gap) * 60.0 * 2.0
 
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
         # ── OVERLAY DASHBOARD ───────────────────────────────────────────────
         race_elapsed  = ts - race_start_time if race_start_time is not None else 0.0
-        tracked_label = tracked_arm.upper() if tracked_arm else "—"
 
         # Race Time = finish − start, shown once finish is locked; counts up live until then
         if race_finish_time is not None:
@@ -265,13 +238,11 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
             race_time_str  = "--:--.--"
             race_time_colour = (160, 160, 160)
 
-        signal_mode = ("WRIST" if (tracked_arm and (lw if tracked_arm == 'left' else rw).visibility >= cfg['wrist_visibility_min']) else "SHOULDER ROLL")
-
         cv2.rectangle(frame, (10, 10), (560, 255), (0, 0, 0), -1)
         cv2.putText(frame, detection_status, (20, 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 200, 0), 2)
-        cv2.putText(frame, f"Arm/Signal   : {tracked_label} / {signal_mode}", (20, 85),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (200, 200, 255), 2)
+        cv2.putText(frame, f"Signal       : BOTH WRISTS (dedup {cfg['min_cycle_time']}s)", (20, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 255), 2)
         cv2.putText(frame, f"Arm Cycles   : {arm_cycle_count}  "
                             f"(~{arm_cycle_count * 2} total strokes)", (20, 125),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
@@ -305,7 +276,7 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
                 arm_cycle_count * 2,
                 round(avg_tempo, 1),
                 round(current_stroke_rate, 1),
-                tracked_arm or "—",
+                "both",
             ],
         }
         df = pd.DataFrame(summary_data)
@@ -327,7 +298,7 @@ def analyze_swim_video(input_video_path, output_video_path, config=None):
         'estimated_total_strokes': arm_cycle_count * 2,
         'average_tempo_spm':      round(avg_tempo, 1),
         'final_tempo_spm':        round(current_stroke_rate, 1),
-        'tracking_arm':           tracked_arm,
+        'tracking_arm':           'both',
         'start_threshold_used':   round(start_threshold, 5),
         'output_file':            output_video_path,
     }
